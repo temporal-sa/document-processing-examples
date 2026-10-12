@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
@@ -13,11 +14,11 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import TemporalError
 
-from .mortgage_models import HumanReviewInput, UnderwritingInput, UnderwritingOutput
+from .mortgage_models import HumanReviewInput, UnderwritingInput, UnderwritingOutput, WorkflowProgress
 from .mortgage_workflow import MortgageUnderwritingWorkflow
 
 TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
@@ -140,6 +141,10 @@ def _page(title: str, body: str, refresh_seconds: int | None = None) -> HTMLResp
       font-size: 12px;
       font-weight: 600;
     }}
+    .badge-waiting {{ background: #fef3c7; color: #92400e; }}
+    .badge-approved {{ background: #d1fae5; color: #065f46; }}
+    .badge-rejected {{ background: #fee2e2; color: #991b1b; }}
+    .badge-inactive {{ background: #e5e7eb; color: #374151; }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -274,15 +279,75 @@ def _safe_extension(filename: str) -> str:
     return ".png"
 
 
-async def _fetch_status(client: Client, case_id: str) -> str:
-    handle = client.get_workflow_handle(_workflow_id(case_id))
+STAGE_LABELS = {
+    "STARTED": "Starting",
+    "EXTRACTING_APPLICATION": "Reading application",
+    "RETRIEVING_POLICY": "Retrieving policy",
+    "RUNNING_ANALYSES": "Analyzing application",
+    "CRITIC_REVIEW": "Reviewing analyses",
+    "DRAFTING_DECISION": "Drafting decision",
+    "AWAITING_HUMAN_REVIEW": "Awaiting human review",
+    "COMPLETED": "Finishing up",
+}
+
+
+def _humanize(value: str) -> str:
+    return value.replace("_", " ").capitalize()
+
+
+def _status_badge(status: str, progress: WorkflowProgress | None, decision: str | None) -> str:
+    """Colored, human-readable status badge.
+
+    Running cases show their current stage; completed cases show the final decision.
+    """
+    if status == "RUNNING":
+        if progress is None:
+            return '<span class="badge">Running</span>'
+        label = STAGE_LABELS.get(progress.stage, _humanize(progress.stage))
+        css = "badge badge-waiting" if progress.stage == "AWAITING_HUMAN_REVIEW" else "badge"
+    elif status == "COMPLETED":
+        label = f"Completed – {_humanize(decision)}" if decision else "Completed"
+        css = {
+            "APPROVED": "badge badge-approved",
+            "REJECTED": "badge badge-rejected",
+        }.get(decision or "", "badge badge-inactive")
+    else:
+        # Failed, timed out, terminated, canceled, not found, etc.
+        label = _humanize(status)
+        css = "badge badge-inactive"
+    return f'<span class="{css}">{_escape(label)}</span>'
+
+
+async def _fetch_decision(handle: WorkflowHandle) -> str | None:
+    try:
+        result = await handle.result()
+    except (TemporalError, ValueError):
+        return None
+    return result.final_decision
+
+
+async def _fetch_progress(handle: WorkflowHandle) -> WorkflowProgress | None:
+    try:
+        return await handle.query(MortgageUnderwritingWorkflow.get_progress)
+    except TemporalError:
+        return None
+
+
+async def _fetch_status(client: Client, case_id: str) -> tuple[str, WorkflowProgress | None, str | None]:
+    """Return the execution status, the current stage if running, and the decision if completed."""
+    handle = client.get_workflow_handle(_workflow_id(case_id), result_type=UnderwritingOutput)
     try:
         description = await handle.describe()
-        if description.status:
-            return description.status.name.replace("WORKFLOW_EXECUTION_STATUS_", "")
     except TemporalError:
-        return "NOT_FOUND"
-    return "UNKNOWN"
+        return "NOT_FOUND", None, None
+    if not description.status:
+        return "UNKNOWN", None, None
+    status = description.status.name.replace("WORKFLOW_EXECUTION_STATUS_", "")
+    # Only query running workflows; querying closed ones forces a full replay on the worker.
+    progress = await _fetch_progress(handle) if status == "RUNNING" else None
+    # Completed results come straight from the server's history, so no worker is needed.
+    decision = await _fetch_decision(handle) if status == "COMPLETED" else None
+    return status, progress, decision
 
 
 def _redirect_with_message(case_id: str, message: str | None = None, error: str | None = None) -> RedirectResponse:
@@ -304,37 +369,41 @@ async def index() -> HTMLResponse:
 
     entries_by_case = {entry.get("case_id", ""): entry for entry in entries if entry.get("case_id")}
 
-    # Pull in any running workflows that were started outside the UI (e.g., demo script).
+    # Pull in running and completed workflows, including ones started outside the UI (e.g., demo script).
     try:
         async for workflow in client.list_workflows(
-            query='WorkflowType = "MortgageUnderwritingWorkflow" and ExecutionStatus = "Running"',
-            limit=50,
+            query=(
+                'WorkflowType = "MortgageUnderwritingWorkflow" '
+                'and (ExecutionStatus = "Running" or ExecutionStatus = "Completed")'
+            ),
+            limit=200,
         ):
             workflow_id = workflow.id
             if not workflow_id.startswith("mortgage-"):
                 continue
             case_id = workflow_id.replace("mortgage-", "", 1)
             if case_id not in entries_by_case:
-                created_at = workflow.start_time.isoformat()
                 entries_by_case[case_id] = {
                     "case_id": case_id,
-                    "created_at": created_at,
+                    "created_at": workflow.start_time.isoformat(),
                     "image_dir": "",
                 }
     except TemporalError:
         pass
 
-    entries = sorted(entries_by_case.values(), key=lambda item: item.get("created_at", ""), reverse=True)
+    entries = sorted(entries_by_case.values(), key=lambda item: item.get("case_id", ""))
+
+    # Look up every case concurrently so the page (and its auto-refresh) stays fast.
+    statuses = await asyncio.gather(*(_fetch_status(client, entry["case_id"]) for entry in entries))
 
     rows = []
-    for entry in entries:
-        case_id = entry.get("case_id", "")
-        status = await _fetch_status(client, case_id) if case_id else "UNKNOWN"
+    for entry, (status, progress, decision) in zip(entries, statuses, strict=True):
+        case_id = entry["case_id"]
         rows.append(
             f"<tr>"
             f"<td><a href=\"/case/{_escape(case_id)}\">{_escape(case_id)}</a></td>"
             f"<td>{_escape(entry.get('created_at', ''))}</td>"
-            f"<td><span class=\"badge\">{_escape(status)}</span></td>"
+            f"<td>{_status_badge(status, progress, decision)}</td>"
             f"</tr>"
         )
 
@@ -390,16 +459,25 @@ async def case_view(case_id: str, message: str | None = None, error: str | None 
     except TemporalError as exc:
         return _page(
             "Case Not Found",
-            f"<h1>Case {case_id}</h1><p>Unable to load workflow: {exc}</p>",
+            f'<p><a href="/">&larr; All cases</a></p>'
+            f"<h1>Case {_escape(case_id)}</h1><p>Unable to load workflow: {_escape(exc)}</p>",
+        )
+    progress = await _fetch_progress(handle) if status_label == "RUNNING" else None
+    progress_block = ""
+    if progress:
+        progress_block = (
+            f'<p class="muted">{_escape(progress.detail)} (updated {_escape(progress.updated_at)})</p>'
         )
     final_decision_block = ""
+    final_decision: str | None = None
     if status_label == "COMPLETED":
         try:
             result = await handle.result()
+            final_decision = result.final_decision
             final_decision_block = f"""
 <div class="card">
   <h2>Final Outcome</h2>
-  <p><span class="badge">{_escape(result.final_decision)}</span></p>
+  <p>{_status_badge(status_label, None, final_decision)}</p>
   <p><strong>Risk Score:</strong> {_escape(result.risk_score)}</p>
   <p><strong>Human Review Required:</strong> {_escape(result.human_review_required)}</p>
   <p><strong>Decision Memo (Preview):</strong></p>
@@ -520,12 +598,14 @@ async def case_view(case_id: str, message: str | None = None, error: str | None 
 """
 
     body = f"""
+<p><a href="/">&larr; All cases</a></p>
 <h1>Case {_escape(case_id)}{f" — {_escape(packet.display_name)}" if packet else ""}</h1>
 <p class="muted">Workflow ID: {_escape(_workflow_id(case_id))}</p>
 {alert_block}
 <div class="card">
   <h2>Status</h2>
-  <p><span class="badge">{_escape(status_label)}</span></p>
+  <p>{_status_badge(status_label, progress, final_decision)}</p>
+  {progress_block}
 </div>
 {final_decision_block}
 
@@ -554,7 +634,8 @@ async def case_view(case_id: str, message: str | None = None, error: str | None 
 </div>
 """ if allow_submit else ""}
 """
-    refresh_seconds = 10 if status_label == "RUNNING" else None
+    # Don't auto-refresh while the review form is shown, or it wipes the reviewer's input.
+    refresh_seconds = 10 if status_label == "RUNNING" and not allow_submit else None
     return _page(f"Case {case_id}", body, refresh_seconds=refresh_seconds)
 
 

@@ -8,6 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 Decision = Literal["APPROVED", "CONDITIONAL", "REJECTED", "HUMAN_REVIEW"]
 HumanDecision = Literal["APPROVED", "REJECTED"]
+WorkflowStage = Literal[
+    "STARTED",
+    "EXTRACTING_APPLICATION",
+    "RETRIEVING_POLICY",
+    "RUNNING_ANALYSES",
+    "CRITIC_REVIEW",
+    "DRAFTING_DECISION",
+    "AWAITING_HUMAN_REVIEW",
+    "COMPLETED",
+]
 
 
 class CollectionItem(BaseModel):
@@ -144,6 +154,14 @@ class UnderwritingInput(BaseModel):
 
     case_id: str
     image_dir: str
+
+
+class WorkflowProgress(BaseModel):
+    """Current stage of the underwriting workflow, exposed via query."""
+
+    stage: WorkflowStage
+    detail: str = ""
+    updated_at: str
 
 
 class UnderwritingMetrics(BaseModel):

@@ -26,6 +26,8 @@ from .mortgage_models import (
     UnderwritingAnalyses,
     UnderwritingInput,
     UnderwritingOutput,
+    WorkflowProgress,
+    WorkflowStage,
 )
 from .mortgage_utils import (
     compute_metrics,
@@ -44,6 +46,16 @@ class MortgageUnderwritingWorkflow:
     def __init__(self) -> None:
         self._human_review: HumanReviewResult | None = None
         self._review_packet: HumanReviewPacket | None = None
+        self._progress = WorkflowProgress(stage="STARTED", updated_at=workflow.now().isoformat())
+
+    def _set_stage(self, stage: WorkflowStage, detail: str = "") -> None:
+        """Record the current stage so the UI can display progress."""
+
+        self._progress = WorkflowProgress(
+            stage=stage,
+            detail=detail,
+            updated_at=workflow.now().isoformat(),
+        )
 
     @workflow.signal
     async def submit_human_review(self, review: HumanReviewInput) -> None:
@@ -63,11 +75,18 @@ class MortgageUnderwritingWorkflow:
 
         return self._review_packet
 
+    @workflow.query
+    def get_progress(self) -> WorkflowProgress:
+        """Expose the current workflow stage for the UI."""
+
+        return self._progress
+
     @workflow.run
     async def run(self, input_data: UnderwritingInput) -> UnderwritingOutput:
         workflow.logger.info("Starting underwriting for case %s", input_data.case_id)
 
         # OCR intake: convert uploaded images into a validated MortgageApplication.
+        self._set_stage("EXTRACTING_APPLICATION", "Reading loan form images")
         applicant = await workflow.execute_activity(
             extract_application_from_images,
             ApplicationOcrTask(case_id=input_data.case_id, image_dir=input_data.image_dir),
@@ -89,6 +108,7 @@ class MortgageUnderwritingWorkflow:
             "decision": "overall underwriting decision thresholds",
         }
 
+        self._set_stage("RETRIEVING_POLICY", "Looking up underwriting policy")
         policy_futures = {
             key: workflow.start_activity(
                 retrieve_policy_context,
@@ -101,7 +121,9 @@ class MortgageUnderwritingWorkflow:
 
         # Run specialist analyses in a fixed, deterministic order.
         analyses = UnderwritingAnalyses(credit="", income="", assets="", collateral="")
-        for agent in ["credit", "income", "assets", "collateral"]:
+        agents = ["credit", "income", "assets", "collateral"]
+        for index, agent in enumerate(agents, start=1):
+            self._set_stage("RUNNING_ANALYSES", f"{agent.title()} analysis ({index} of {len(agents)})")
             result = await workflow.execute_activity(
                 run_agent_analysis,
                 AgentTask(
@@ -116,6 +138,7 @@ class MortgageUnderwritingWorkflow:
 
         # Critic pass to check for missed risks or inconsistencies.
         critic_policy = policy_context["decision"]
+        self._set_stage("CRITIC_REVIEW", "Checking analyses for missed risks")
 
         critic_review = await workflow.execute_activity(
             run_critic_review,
@@ -130,6 +153,7 @@ class MortgageUnderwritingWorkflow:
         )
 
         # Decision memo from LLM (structured JSON with decision + memo).
+        self._set_stage("DRAFTING_DECISION", "Drafting decision memo")
         decision_result = await workflow.execute_activity(
             run_decision_memo,
             DecisionTask(
@@ -202,9 +226,15 @@ class MortgageUnderwritingWorkflow:
                 risk_score=risk_score,
             )
             # Pause until a human reviewer signals the workflow.
+            self._set_stage(
+                "AWAITING_HUMAN_REVIEW",
+                decision_recommendation.human_review_reason or "Conditional decision needs review",
+            )
             await workflow.wait_condition(lambda: self._human_review is not None)
             human_review = self._human_review
             final_decision = human_review.decision
+
+        self._set_stage("COMPLETED", f"Final decision: {final_decision}")
 
         # Emit the final underwriting output for the case.
         return UnderwritingOutput(
