@@ -113,6 +113,10 @@ async def test_workflow_human_review_signal(client) -> None:
         assert packet.decision_recommendation.decision == "CONDITIONAL"
         assert packet.display_name
 
+        progress = await handle.query(MortgageUnderwritingWorkflow.get_progress)
+        assert progress.stage == "AWAITING_HUMAN_REVIEW"
+        assert progress.detail == "test review"
+
         await handle.signal(
             MortgageUnderwritingWorkflow.submit_human_review,
             HumanReviewInput(
@@ -130,3 +134,6 @@ async def test_workflow_human_review_signal(client) -> None:
         assert result.analyses.assets
         assert result.analyses.collateral
         assert "[APPLICANT_NAME]" not in result.decision_memo
+
+        progress = await handle.query(MortgageUnderwritingWorkflow.get_progress)
+        assert progress.stage == "COMPLETED"

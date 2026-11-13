@@ -112,8 +112,14 @@ async def main() -> None:
         TEMPORAL_ADDRESS,
         data_converter=pydantic_data_converter,
     )
-    for case_id in case_ids:
-        await _run_case(client, case_id, str(image_dir))
+    # Run all cases concurrently so a case waiting on human review doesn't block the others.
+    results = await asyncio.gather(
+        *(_run_case(client, case_id, str(image_dir)) for case_id in case_ids),
+        return_exceptions=True,
+    )
+    for case_id, outcome in zip(case_ids, results, strict=True):
+        if isinstance(outcome, Exception):
+            print(f"Case {case_id} failed: {outcome}")
 
 
 if __name__ == "__main__":
